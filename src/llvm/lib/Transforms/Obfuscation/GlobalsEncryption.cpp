@@ -67,75 +67,79 @@ void __obfu_globalenc_enc(uint8_t *Data, uint8_t *Key, int64_t Len,
   }
 }
 void GlobalsEncryption::process(Module &M) {
-
-  const DataLayout &DL = M.getDataLayout();
-  std::set<GlobalVariable *> GVs;
-  for (Function &F : M) {
-    for (BasicBlock &BB : F) {
-      for (Instruction &I : BB) {
-        for (Value *Opnd : I.operands()) {
-          if (!isa<GlobalVariable>(*Opnd)) {
-            continue;
-          }
-          GlobalVariable *GV = (GlobalVariable *)Opnd;
-          if (GV->isConstant() && GV->hasInitializer() &&
-              (GV->getValueType()->isIntegerTy() ||
-               GV->getValueType()->isArrayTy())) {
-            GlobalValue::LinkageTypes LT = GV->getLinkage();
-            if (LT == GlobalValue::InternalLinkage ||
-                LT == GlobalValue::PrivateLinkage) {
-              GVs.insert(GV);
+    const DataLayout &DL = M.getDataLayout();
+    std::set<GlobalVariable *> GVs;
+    
+    for (Function &F : M) {
+        for (BasicBlock &BB : F) {
+            for (Instruction &I : BB) {
+                for (Value *Opnd : I.operands()) {
+                    if (auto *GV = dyn_cast<GlobalVariable>(Opnd)) {
+                        if (GV->isConstant() && GV->hasInitializer() &&
+                            (GV->getValueType()->isIntegerTy() ||
+                             GV->getValueType()->isArrayTy())) {
+                            GlobalValue::LinkageTypes LT = GV->getLinkage();
+                            if (LT == GlobalValue::InternalLinkage ||
+                                LT == GlobalValue::PrivateLinkage) {
+                                GVs.insert(GV);
+                            }
+                        }
+                    }
+                }
             }
-          }
         }
-      }
-    }
-  }
-  Function *DecFunc = buildDecryptFunction(M);
-  for (GlobalVariable *GV : GVs) {
-    bool Ok = true;
-    std::vector<Instruction *> Insts;
-    std::set<Function *> Funcs;
-    for (auto Iter = GV->user_begin(); Iter != GV->user_end(); ++Iter) {
-      Value *V = *Iter;
-      if (!isa<Instruction>(*V)) {
-        Ok = false;
-        break;
-      }
-      Instruction *I = (Instruction *)V;
-      Insts.push_back(I);
-      Funcs.insert(I->getParent()->getParent());
-    }
-    if (!Ok) {
-      continue;
     }
 
-    unsigned K = getRandomNumber();
-    Type *Ty = GV->getValueType();
-    uint64_t Size = DL.getTypeAllocSize(Ty);
-    if (Ty->isIntegerTy()) {
-      ConstantInt *CI = (ConstantInt *)GV->getInitializer();
-      uint64_t V = CI->getZExtValue();
-      __obfu_globalenc_enc((uint8_t *)&V, (uint8_t *)&K, Size, KEY_LEN);
-      GV->setInitializer(ConstantInt::get(Ty, V));
-    } else if (Ty->isArrayTy()) {
-      ArrayType *AT = (ArrayType *)Ty;
-      Type *EleTy = AT->getArrayElementType();
-      if (!EleTy->isIntegerTy()) {
-        continue;
-      }
-      ConstantDataArray *CA = (ConstantDataArray *)GV->getInitializer();
-      const char *Data = (const char *)CA->getRawDataValues().data();
-      char *Tmp = new char[Size];
-      memcpy(Tmp, Data, Size);
-      __obfu_globalenc_enc((uint8_t *)Tmp, (uint8_t *)&K, Size, KEY_LEN);
-      GV->setInitializer(ConstantDataArray::getRaw(StringRef((char *)Tmp, Size),
-                                                   CA->getNumElements(),
-                                                   CA->getElementType()));
+    Function *DecFunc = buildDecryptFunction(M);
+    
+    for (GlobalVariable *GV : GVs) {
+        bool Ok = true;
+        std::vector<Instruction *> Insts;
+        std::set<Function *> Funcs;
+        
+        // 安全地遍历用户
+        for (User *U : GV->users()) {
+            if (auto *I = dyn_cast<Instruction>(U)) {
+                Insts.push_back(I);
+                Funcs.insert(I->getParent()->getParent());
+            } else {
+                Ok = false;
+                break;
+            }
+        }
+        
+        if (!Ok) continue;
 
-    } else {
-      continue;
-    }
+        unsigned K = getRandomNumber();
+        Type *Ty = GV->getValueType();
+        uint64_t Size = DL.getTypeAllocSize(Ty);
+        
+        // 安全地处理常量
+        if (Ty->isIntegerTy()) {
+            if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer())) {
+                uint64_t V = CI->getZExtValue();
+                __obfu_globalenc_enc((uint8_t *)&V, (uint8_t *)&K, Size, KEY_LEN);
+                GV->setInitializer(ConstantInt::get(Ty, V));
+            }
+        } else if (Ty->isArrayTy()) {
+            ArrayType *AT = cast<ArrayType>(Ty);
+            Type *EleTy = AT->getArrayElementType();
+            if (!EleTy->isIntegerTy()) continue;
+            
+            if (auto *CA = dyn_cast<ConstantDataArray>(GV->getInitializer())) {
+                ArrayRef<uint8_t> RawData = CA->getRawDataValues();
+                if (RawData.size() >= Size) {
+                    char *Tmp = new char[Size];
+                    memcpy(Tmp, RawData.data(), Size);
+                    __obfu_globalenc_enc((uint8_t *)Tmp, (uint8_t *)&K, Size, KEY_LEN);
+                    GV->setInitializer(ConstantDataArray::getRaw(
+                        StringRef(Tmp, Size), CA->getNumElements(), CA->getElementType()));
+                    delete[] Tmp;
+                }
+            }
+        } else {
+            continue;
+        }
 
     std::map<Function *, Value *> FV;
     for (Function *F : Funcs) {
