@@ -6,6 +6,10 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 namespace polaris {
@@ -60,113 +64,122 @@ Function *GlobalsEncryption::buildDecryptFunction(Module &M) {
   IRB.CreateRetVoid();
   return F;
 }
-void __obfu_globalenc_enc(uint8_t *Data, uint8_t *Key, int64_t Len,
-                          int64_t KeyLen) {
-  for (int64_t i = 0; i < Len; i++) {
-    Data[i] ^= Key[i % KeyLen];
-  }
-}
+
 void GlobalsEncryption::process(Module &M) {
-    const DataLayout &DL = M.getDataLayout();
-    std::set<GlobalVariable *> GVs;
+  const DataLayout &DL = M.getDataLayout();
+  std::set<GlobalVariable *> GVs;
+  
+  // 收集符合条件的全局变量
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.isConstant() && GV.hasInitializer() &&
+        (GV.getValueType()->isIntegerTy() || GV.getValueType()->isArrayTy())) {
+      GlobalValue::LinkageTypes LT = GV.getLinkage();
+      if (LT == GlobalValue::InternalLinkage ||
+          LT == GlobalValue::PrivateLinkage) {
+        GVs.insert(&GV);
+      }
+    }
+  }
+
+  Function *DecFunc = buildDecryptFunction(M);
+  
+  for (GlobalVariable *GV : GVs) {
+    // 检查用户是否都是指令
+    bool Ok = true;
+    std::vector<Instruction *> Insts;
+    std::set<Function *> Funcs;
     
-    for (Function &F : M) {
-        for (BasicBlock &BB : F) {
-            for (Instruction &I : BB) {
-                for (Value *Opnd : I.operands()) {
-                    if (auto *GV = dyn_cast<GlobalVariable>(Opnd)) {
-                        if (GV->isConstant() && GV->hasInitializer() &&
-                            (GV->getValueType()->isIntegerTy() ||
-                             GV->getValueType()->isArrayTy())) {
-                            GlobalValue::LinkageTypes LT = GV->getLinkage();
-                            if (LT == GlobalValue::InternalLinkage ||
-                                LT == GlobalValue::PrivateLinkage) {
-                                GVs.insert(GV);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    for (auto *U : GV->users()) {
+      if (!isa<Instruction>(U)) {
+        Ok = false;
+        break;
+      }
+      Instruction *I = cast<Instruction>(U);
+      Insts.push_back(I);
+      Funcs.insert(I->getFunction());
+    }
+    
+    if (!Ok || Funcs.empty()) {
+      continue;
     }
 
-    Function *DecFunc = buildDecryptFunction(M);
+    // 生成随机密钥
+    uint32_t K = getRandomNumber();
+    Type *Ty = GV->getValueType();
+    uint64_t Size = DL.getTypeAllocSize(Ty);
     
-    for (GlobalVariable *GV : GVs) {
-        bool Ok = true;
-        std::vector<Instruction *> Insts;
-        std::set<Function *> Funcs;
+    // 加密初始值
+    if (Ty->isIntegerTy()) {
+      if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer())) {
+        uint64_t V = CI->getZExtValue();
+        // 执行异或加密
+        uint8_t *Data = reinterpret_cast<uint8_t*>(&V);
+        uint8_t *KeyData = reinterpret_cast<uint8_t*>(&K);
+        for (uint64_t i = 0; i < Size; i++) {
+          Data[i] ^= KeyData[i % KEY_LEN];
+        }
+        GV->setInitializer(ConstantInt::get(Ty, V));
+      }
+    } else if (Ty->isArrayTy()) {
+      ArrayType *AT = cast<ArrayType>(Ty);
+      Type *EleTy = AT->getArrayElementType();
+      if (!EleTy->isIntegerTy()) {
+        continue;
+      }
+      
+      if (auto *CA = dyn_cast<ConstantDataArray>(GV->getInitializer())) {
+        std::vector<uint8_t> DataBytes;
+        StringRef Data = CA->getRawDataValues();
+        DataBytes.assign(Data.begin(), Data.end());
         
-        // 安全地遍历用户
-        for (User *U : GV->users()) {
-            if (auto *I = dyn_cast<Instruction>(U)) {
-                Insts.push_back(I);
-                Funcs.insert(I->getParent()->getParent());
-            } else {
-                Ok = false;
-                break;
-            }
+        // 执行异或加密
+        uint8_t *KeyData = reinterpret_cast<uint8_t*>(&K);
+        for (uint64_t i = 0; i < DataBytes.size(); i++) {
+          DataBytes[i] ^= KeyData[i % KEY_LEN];
         }
         
-        if (!Ok) continue;
-
-        unsigned K = getRandomNumber();
-        Type *Ty = GV->getValueType();
-        uint64_t Size = DL.getTypeAllocSize(Ty);
-        
-        // 安全地处理常量
-        if (Ty->isIntegerTy()) {
-            if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer())) {
-                uint64_t V = CI->getZExtValue();
-                __obfu_globalenc_enc((uint8_t *)&V, (uint8_t *)&K, Size, KEY_LEN);
-                GV->setInitializer(ConstantInt::get(Ty, V));
-            }
-        } else if (Ty->isArrayTy()) {
-            ArrayType *AT = cast<ArrayType>(Ty);
-            Type *EleTy = AT->getArrayElementType();
-            if (!EleTy->isIntegerTy()) continue;
-            
-            if (auto *CA = dyn_cast<ConstantDataArray>(GV->getInitializer())) {
-                ArrayRef<uint8_t> RawData = CA->getRawDataValues();
-                if (RawData.size() >= Size) {
-                    char *Tmp = new char[Size];
-                    memcpy(Tmp, RawData.data(), Size);
-                    __obfu_globalenc_enc((uint8_t *)Tmp, (uint8_t *)&K, Size, KEY_LEN);
-                    GV->setInitializer(ConstantDataArray::getRaw(
-                        StringRef(Tmp, Size), CA->getNumElements(), CA->getElementType()));
-                    delete[] Tmp;
-                }
-            }
-        } else {
-            continue;
-        }
+        GV->setInitializer(ConstantDataArray::get(
+            M.getContext(), ArrayRef<uint8_t>(DataBytes)));
+      }
+    } else {
+      continue;
+    }
 
     std::map<Function *, Value *> FV;
+    
+    // 在每个使用函数中创建解密代码
     for (Function *F : Funcs) {
+      if (F->isDeclaration()) continue;
+      
       IRBuilder<> IRB(&*F->getEntryBlock().getFirstInsertionPt());
       AllocaInst *Copy = IRB.CreateAlloca(Ty);
       Copy->setAlignment(Align(GV->getAlignment()));
-      IRB.CreateMemCpy(Copy, (MaybeAlign)0, GV, (MaybeAlign)0,
-                       IRB.getInt64(Size));
-      AllocaInst *Key = IRB.CreateAlloca(IRB.getInt32Ty());
-      IRB.CreateStore(IRB.getInt32(K), Key);
-      IRB.CreateCall(FunctionCallee(DecFunc),
-                     {
-                         IRB.CreateBitOrPointerCast(Copy, IRB.getInt8PtrTy()),
-                         IRB.CreateBitOrPointerCast(Key, IRB.getInt8PtrTy()),
-                         IRB.getInt64(Size),
-                         IRB.getInt64(KEY_LEN),
-                     });
+      
+      // 创建全局变量的副本
+      IRB.CreateMemCpy(Copy, MaybeAlign(GV->getAlignment()), 
+                       GV, MaybeAlign(GV->getAlignment()), 
+                       ConstantInt::get(IRB.getInt64Ty(), Size));
+      
+      // 创建密钥变量
+      AllocaInst *KeyAlloca = IRB.CreateAlloca(IRB.getInt32Ty());
+      IRB.CreateStore(IRB.getInt32(K), KeyAlloca);
+      
+      // 调用解密函数
+      IRB.CreateCall(DecFunc, {
+          IRB.CreateBitCast(Copy, IRB.getInt8PtrTy()),
+          IRB.CreateBitCast(KeyAlloca, IRB.getInt8PtrTy()),
+          IRB.getInt64(Size),
+          IRB.getInt64(KEY_LEN)
+      });
+      
       FV[F] = Copy;
     }
 
+    // 替换全局变量的使用
     for (Instruction *I : Insts) {
-      Function *F = I->getParent()->getParent();
-      Value *C = FV[F];
-      for (Use &U : I->operands()) {
-        if (U.get() == GV) {
-          U.set(C);
-        }
+      Function *F = I->getFunction();
+      if (FV.find(F) != FV.end()) {
+        I->replaceUsesOfWith(GV, FV[F]);
       }
     }
   }
